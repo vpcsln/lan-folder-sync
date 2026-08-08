@@ -1,0 +1,8 @@
+{
+  "host": "cachyos",
+  "remote_user": "vpc",
+  "local_root": "/home/you/Dokumente/studium",
+  "remote_root": "/home/vpc/Dokumente/studium",
+  "ssh_key": "~/.ssh/id_ed25519_sync",
+  "os_match": "cachyos"
+}

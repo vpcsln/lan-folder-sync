@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editors
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Runtime state (kept in ~/.local/share/lan-folder-sync, never in the repo)
+state.json
+log
+lock
+files-*
