@@ -55,8 +55,28 @@ PYEOF
 
 REMOTE="$(config_get host)"
 REMOTE_USER="$(config_get remote_user)"
-KEY="$(eval echo "$(config_get ssh_key)")"
+KEY="$(config_get ssh_key)"
+# expand a leading ~ without eval (the old `eval echo` allowed config-driven
+# command injection; ${var/#\~/$HOME} only touches a leading tilde)
+KEY="${KEY/#\~/$HOME}"
 OS_MATCH="$(config_get os_match)"
+
+# ---- config validation (defense in depth: hostile config/env values must
+# never reach ssh/rsync as options or shell text) --------------------------
+case "$REMOTE" in
+    ""|-*) echo "invalid host '$REMOTE' (must not be empty or start with '-')" >&2; exit 2;;
+    *[!A-Za-z0-9._-]*) echo "invalid host '$REMOTE' (allowed: letters, digits, . _ -)" >&2; exit 2;;
+esac
+case "$REMOTE_USER" in
+    ""|-*) echo "invalid remote_user '$REMOTE_USER'" >&2; exit 2;;
+    *[!A-Za-z0-9._-]*) echo "invalid remote_user '$REMOTE_USER'" >&2; exit 2;;
+esac
+case "$OS_MATCH" in
+    ""|-*) echo "invalid os_match '$OS_MATCH'" >&2; exit 2;;
+    *[!A-Za-z0-9_-]*) echo "invalid os_match '$OS_MATCH' (allowed: letters, digits, _ -)" >&2; exit 2;;
+esac
+[[ -n "$KEY" ]] || { echo "invalid ssh_key: empty" >&2; exit 2; }
+[[ -f "$KEY" ]] || { echo "ssh key not found: $KEY (run ssh-keygen / ssh-copy-id)" >&2; exit 2; }
 
 usage() {
     cat <<EOF
@@ -67,6 +87,11 @@ Paths and host come from ~/.config/lan-folder-sync/config.json
 (or LAN_SYNC_HOST / LAN_SYNC_REMOTE_USER / LAN_SYNC_REMOTE_ROOT / LAN_SYNC_LOCAL_ROOT env vars).
 
 The laptop is found automatically (cached IP -> mDNS -> subnet scan).
+Discovery only trusts hosts whose SSH host key matches the pinned entry
+for the alias in ~/.ssh/known_hosts; no key is ever auto-accepted and the
+pin is never erased automatically. First run: pin the key once interactively
+(see the error message if the tool refuses).
+
 The sync tool shows all differences at once and offers bulk modes
 (pull all / push all / newest wins), with no deletions ever.
 
@@ -104,20 +129,40 @@ current_hostname() {
 }
 
 set_hostname() {
-    awk -v host="$REMOTE" -v h="$1" '
+    local mode
+    mode="$(stat -c%a "$SSH_CONFIG" 2>/dev/null || printf '600')"
+    if ! awk -v host="$REMOTE" -v h="$1" '
         /^Host /{h2=$2; print; next}
         h2==host && /^[[:space:]]*HostName /{print "    HostName " h; next}
         {print}
-    ' "$SSH_CONFIG" > "$SSH_CONFIG.tmp" && mv "$SSH_CONFIG.tmp" "$SSH_CONFIG"
+    ' "$SSH_CONFIG" > "$SSH_CONFIG.tmp"; then
+        rm -f "$SSH_CONFIG.tmp"
+        return 1
+    fi
+    chmod 600 "$SSH_CONFIG.tmp"
+    if ! mv "$SSH_CONFIG.tmp" "$SSH_CONFIG"; then
+        rm -f "$SSH_CONFIG.tmp"
+        return 1
+    fi
+    chmod "$mode" "$SSH_CONFIG"
 }
 
+# is_laptop: connect through the alias (config-cached HostName) and check
+# the os-release identity. StrictHostKeyChecking=yes: only a host key that
+# exactly matches the pinned entry is accepted; nothing is ever added.
 is_laptop() {
-    ssh $SSH_OPTS -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" "$REMOTE" "grep -qis '$OS_MATCH' /etc/os-release" 2>/dev/null
+    ssh $SSH_OPTS -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        "$REMOTE" "grep -qis '$OS_MATCH' /etc/os-release" 2>/dev/null
 }
 
-test_candidate() {
-    ssh $SSH_OPTS -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o IdentitiesOnly=yes -i "$KEY" "$REMOTE_USER@$1" "grep -qis '$OS_MATCH' /etc/os-release" 2>/dev/null
+# probe_ip: verify a candidate IP against the PINNED host key (HostKeyAlias
+# makes ssh look up the alias entry in known_hosts) and check identity.
+# This is what makes the subnet scan immune to impostors: a host that does
+# not present the pinned key is refused before any trust is placed in it.
+probe_ip() {
+    ssh $SSH_OPTS -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        -o HostKeyAlias="$REMOTE" -o IdentitiesOnly=yes -i "$KEY" \
+        "$REMOTE_USER@$1" "grep -qis '$OS_MATCH' /etc/os-release" 2>/dev/null
 }
 
 mdns_ip() {
@@ -125,7 +170,7 @@ mdns_ip() {
 }
 
 subnet_prefix() {
-    ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | awk -F. '{printf "%s.%s.%s.", $1, $2, $3}'
+    ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \\([0-9.]*\\).*/\\1/p' | awk -F. '{printf "%s.%s.%s.", $1, $2, $3}'
 }
 
 scan_candidates() {
@@ -137,8 +182,34 @@ scan_candidates() {
     wait
 }
 
+pin_laptop() {
+    echo "  No host key is pinned for '$REMOTE' yet."
+    echo "  You will see the laptop's host-key fingerprint — verify it"
+    echo "  against the machine before answering yes."
+    # interactive, NOT BatchMode: ssh asks the user to confirm the key
+    if ! ssh -o StrictHostKeyChecking=ask -o ConnectTimeout=5 "$REMOTE" true; then
+        echo "ERROR: host key pinning aborted." >&2
+        return 1
+    fi
+    echo "  Host key pinned for '$REMOTE'."
+    return 0
+}
+
 ensure_laptop() {
     echo "Looking for laptop ($REMOTE)..."
+
+    # No pin -> never auto-accept (no accept-new TOFU). In an interactive
+    # terminal the user is asked to verify the fingerprint; otherwise fail.
+    if ! ssh-keygen -F "$REMOTE" >/dev/null 2>&1; then
+        if [[ ! -t 0 ]]; then
+            echo "ERROR: no host key is pinned for '$REMOTE' yet." >&2
+            echo "  Run this ONCE, interactively, and verify the fingerprint:" >&2
+            echo "    ssh -o StrictHostKeyChecking=ask $REMOTE true" >&2
+            return 1
+        fi
+        pin_laptop || return 1
+    fi
+
     if is_laptop; then
         echo "  found at $(current_hostname) (cached)"
         return 0
@@ -147,19 +218,19 @@ ensure_laptop() {
     local ip
     ip="$(mdns_ip || true)"
     if [[ -n "$ip" ]]; then
-        set_hostname "$ip"
-        if is_laptop; then
-            echo "  found via mDNS: $ip"
-            return 0
+        if probe_ip "$ip"; then
+            if set_hostname "$ip" && is_laptop; then
+                echo "  found via mDNS: $ip"
+                return 0
+            fi
         fi
     fi
 
     local found=""
     while read -r ip; do
         [[ -n "$ip" ]] || continue
-        if test_candidate "$ip"; then
-            set_hostname "$ip"
-            if is_laptop || { ssh-keygen -R "$REMOTE" >/dev/null 2>&1; is_laptop; }; then
+        if probe_ip "$ip"; then
+            if set_hostname "$ip" && is_laptop; then
                 found="$ip"
                 break
             fi
@@ -175,6 +246,8 @@ ensure_laptop() {
     echo "  - Is it on the same network/WiFi?" >&2
     echo "  - Is sshd running there? (sudo systemctl enable --now sshd)" >&2
     echo "  - Is your key installed? (ssh-copy-id -i $KEY.pub ${REMOTE_USER}@<laptop-ip>)" >&2
+    echo "  - Did the laptop's host key change (reinstall)? Re-pin it manually:" >&2
+    echo "      ssh-keygen -R $REMOTE && ssh -o StrictHostKeyChecking=ask $REMOTE true" >&2
     echo "  - eduroam may block direct device connections." >&2
     return 1
 }

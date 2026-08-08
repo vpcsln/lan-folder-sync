@@ -1,0 +1,9 @@
+#!/bin/bash
+# Stub timeout: report the /dev/tcp probe for 127.0.0.1:22 as open,
+# everything else passes through to the real timeout.
+for a in "$@"; do
+    if [[ "$a" == *"/dev/tcp/127.0.0.1/22"* ]]; then
+        exit 0
+    fi
+done
+exec /usr/bin/timeout "$@"

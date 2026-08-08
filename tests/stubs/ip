@@ -1,0 +1,7 @@
+#!/bin/bash
+# Stub ip: report a fixed IPv4 source so the subnet scan probes 127.0.0.x.
+if [[ "$1" == "-4" && "$2" == "route" ]]; then
+    echo "default via 127.0.0.1 dev lo src 127.0.0.1 uid 1000"
+    exit 0
+fi
+exec /usr/bin/ip "$@"

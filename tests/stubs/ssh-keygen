@@ -1,0 +1,19 @@
+#!/bin/bash
+# Stub ssh-keygen. The REAL ssh-keygen resolves known_hosts via the passwd
+# database, NOT $HOME (audit F1 disclosure) — so it must never run here.
+# -F: report whether the alias has a pinned key in $HOME/.ssh/known_hosts
+# -R: simulate pin removal; records the call (post-fix code must never call it)
+LOG="${FAKE_SSH_LOG:-/tmp/opencode/tests-regression/ssh.log}"
+echo "ssh-keygen $*" >> "$LOG"
+KH="$HOME/.ssh/known_hosts"
+case "$1" in
+    -F)
+        awk -v h="$2" '$1==h{found=1} END{exit found?0:1}' "$KH" 2>/dev/null
+        ;;
+    -R)
+        echo "ssh-keygen -R CALLED (host-key pin erased!)" >> "$LOG"
+        awk -v h="$2" '$1!=h' "$KH" > "$KH.tmp" 2>/dev/null && mv "$KH.tmp" "$KH"
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac

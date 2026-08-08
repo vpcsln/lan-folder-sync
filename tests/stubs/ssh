@@ -1,0 +1,74 @@
+#!/bin/bash
+# Stub ssh for launcher regression tests. Models real OpenSSH semantics:
+#   - host key verification against the known_hosts entry for the alias
+#     (HostKeyAlias); impostor key (FAKE_SERVER_KEY != pinned) -> refuse 255
+#   - StrictHostKeyChecking=ask/accept-new add new keys (TOFU)
+#   - StrictHostKeyChecking=no accepts anything
+#   - the first os-release grep probe fails when FAKE_FIRST_GREP_FAIL=1
+#     (simulates the cached IP being unreachable)
+# Records every invocation to $FAKE_SSH_LOG.
+LOG="${FAKE_SSH_LOG:-/tmp/opencode/tests-regression/ssh.log}"
+COUNTER="${FAKE_SSH_COUNTER:-/tmp/opencode/tests-regression/grep_count}"
+echo "ssh $*" >> "$LOG"
+
+UHKF="" HKA="" SHCK="" CMD="" HOST=""
+i=1
+while (( i <= $# )); do
+    a="${!i}"
+    case "$a" in
+        -o)
+            i=$((i + 1)); opt="${!i}"
+            key="${opt%%=*}"; val="${opt#*=}"
+            [[ "$key" == "UserKnownHostsFile" ]] && UHKF="$val"
+            [[ "$key" == "HostKeyAlias" ]] && HKA="$val"
+            [[ "$key" == "StrictHostKeyChecking" ]] && SHCK="$val"
+            [[ "$key" == "BatchMode" ]] && BATCH=1
+            ;;
+        -i) i=$((i + 1)) ;;           # identity file path, ignored
+        -*) ;;
+        *)
+            if [[ -z "$HOST" ]]; then HOST="$a"; else CMD="$CMD $a"; fi
+            ;;
+    esac
+    i=$((i + 1))
+done
+UHKF="${UHKF:-$HOME/.ssh/known_hosts}"
+
+PIN="$(awk -v h="${HKA:-cachyos}" '$1==h{print $3; exit}' "$UHKF" 2>/dev/null)"
+
+if [[ "$CMD" == *"grep -qis"* ]]; then
+    n=0; [[ -f "$COUNTER" ]] && n=$(cat "$COUNTER"); n=$((n + 1)); echo "$n" > "$COUNTER"
+    if [[ "$FAKE_FIRST_GREP_FAIL" == 1 && $n -eq 1 ]]; then
+        echo "ssh: cached is_laptop probe failed (simulated)" >> "$LOG"
+        exit 255
+    fi
+fi
+
+if [[ -n "$PIN" ]]; then
+    if [[ "$PIN" == "${FAKE_SERVER_KEY:-}" ]]; then
+        [[ "$FAKE_CMD_OK" == 1 ]] && exit 0 || exit 255
+    else
+        echo "ssh: REMOTE HOST IDENTIFICATION HAS CHANGED (simulated)" >> "$LOG"
+        exit 255
+    fi
+fi
+
+case "$SHCK" in
+    ask)
+        echo "ssh: user accepted new host key (simulated)" >> "$LOG"
+        echo "cachyos ssh-ed25519 ${FAKE_SERVER_KEY:-} stub" >> "$UHKF"
+        exit 0
+        ;;
+    accept-new)
+        echo "ssh: accept-new added new host key (simulated)" >> "$LOG"
+        echo "cachyos ssh-ed25519 ${FAKE_SERVER_KEY:-} stub" >> "$UHKF"
+        [[ "$FAKE_CMD_OK" == 1 ]] && exit 0 || exit 255
+        ;;
+    no)
+        [[ "$FAKE_CMD_OK" == 1 ]] && exit 0 || exit 255
+        ;;
+    *)
+        echo "ssh: no hostkey known (simulated)" >> "$LOG"
+        exit 255
+        ;;
+esac

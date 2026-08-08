@@ -23,10 +23,12 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from datetime import datetime
 
 APP_NAME = "lan-folder-sync"
@@ -37,6 +39,13 @@ DEFAULT_REMOTE_ROOT = "/home/vpc/Dokumente/studium"
 DEFAULT_SSH_KEY = "~/.ssh/id_ed25519_sync"
 THRESHOLD = 2.0
 CHANGE_EPS = 0.5
+STATE_VERSION = 1
+MAX_STATE_BYTES = 64 << 20    # refuse oversized state files (DoS guard)
+MAX_LOG_BYTES = 1 << 20       # rotate the log file past 1 MiB
+STOP_AFTER = 0                # rsync --stop-after minutes; 0 = unlimited
+HOST_PAT = re.compile(r"^[A-Za-z0-9._-]+$")
+USER_PAT = re.compile(r"^[A-Za-z0-9._-]+$")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 HOST = DEFAULT_HOST
 REMOTE_USER = DEFAULT_REMOTE_USER
@@ -51,7 +60,7 @@ LOCK_FILE = os.path.join(STATE_DIR, "lock")
 
 def load_config():
     global HOST, REMOTE_USER, LOCAL_ROOT, REMOTE_ROOT, SSH_KEY
-    global STATE_DIR, STATE_FILE, LOG_FILE, LOCK_FILE
+    global STATE_DIR, STATE_FILE, LOG_FILE, LOCK_FILE, STOP_AFTER
     cfg = {}
     path = os.path.join(os.path.expanduser("~/.config"), APP_NAME, "config.json")
     try:
@@ -59,35 +68,149 @@ def load_config():
             cfg = json.load(f)
     except (OSError, ValueError):
         pass
+    if not isinstance(cfg, dict):
+        cfg = {}
 
-    def get(key, env, default):
-        v = os.environ.get(env, "")
-        if v:
-            return v
-        return cfg.get(key) or default
+    notes = []
 
-    HOST = get("host", "LAN_SYNC_HOST", DEFAULT_HOST)
-    REMOTE_USER = get("remote_user", "LAN_SYNC_REMOTE_USER", DEFAULT_REMOTE_USER)
-    LOCAL_ROOT = os.path.abspath(os.path.expanduser(get("local_root", "LAN_SYNC_LOCAL_ROOT", DEFAULT_LOCAL_ROOT)))
-    REMOTE_ROOT = get("remote_root", "LAN_SYNC_REMOTE_ROOT", DEFAULT_REMOTE_ROOT)
-    SSH_KEY = os.path.abspath(os.path.expanduser(get("ssh_key", "LAN_SYNC_SSH_KEY", DEFAULT_SSH_KEY)))
-    state_dir = os.path.abspath(os.path.expanduser(get("state_dir", "LAN_SYNC_STATE_DIR", "~/.local/share/" + APP_NAME)))
+    def pick(key, env, default, pattern=None, absolute=False):
+        """env -> config -> default, validating the chosen value.
+        Invalid values (non-string, control chars, pattern mismatch,
+        non-absolute paths) are rejected with a log note and the default
+        is used instead."""
+        raw = os.environ.get(env)
+        if raw is None:
+            raw = cfg.get(key)
+        if isinstance(raw, str) and raw and not CONTROL_RE.search(raw) \
+                and (pattern is None or pattern.match(raw)) \
+                and (not absolute or raw.startswith("/")):
+            return raw
+        notes.append("config: invalid value for %s (using default)" % key)
+        return default
+
+    HOST = pick("host", "LAN_SYNC_HOST", DEFAULT_HOST, HOST_PAT)
+    if HOST.startswith("-"):
+        HOST = DEFAULT_HOST
+        notes.append("config: invalid value for host (using default)")
+    REMOTE_USER = pick("remote_user", "LAN_SYNC_REMOTE_USER", DEFAULT_REMOTE_USER, USER_PAT)
+    LOCAL_ROOT = os.path.abspath(os.path.expanduser(
+        pick("local_root", "LAN_SYNC_LOCAL_ROOT", DEFAULT_LOCAL_ROOT)))
+    REMOTE_ROOT = pick("remote_root", "LAN_SYNC_REMOTE_ROOT", DEFAULT_REMOTE_ROOT,
+                       absolute=True)
+    SSH_KEY = os.path.abspath(os.path.expanduser(
+        pick("ssh_key", "LAN_SYNC_SSH_KEY", DEFAULT_SSH_KEY)))
+    state_dir = os.path.abspath(os.path.expanduser(
+        pick("state_dir", "LAN_SYNC_STATE_DIR", "~/.local/share/" + APP_NAME)))
     STATE_DIR = state_dir
     STATE_FILE = os.path.join(STATE_DIR, "state.json")
     LOG_FILE = os.path.join(STATE_DIR, "log")
     LOCK_FILE = os.path.join(STATE_DIR, "lock")
+    try:
+        raw_stop = os.environ.get("LAN_SYNC_STOP_AFTER")
+        if raw_stop is None:
+            raw_stop = cfg.get("stop_after_minutes", "0")
+        STOP_AFTER = max(0, int(raw_stop))
+    except (TypeError, ValueError):
+        STOP_AFTER = 0
+        notes.append("config: invalid stop_after_minutes (using 0 = unlimited)")
+    for n in notes:
+        log(n)
 
 
 class SyncError(Exception):
     pass
 
 
+def safe_text(s):
+    """Byte-safe, control-free text for display (no truncation)."""
+    s = s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    return "".join(ch if ch >= " " and ch != "\x7f" else "?" for ch in s)
+
+
+def disp_width(s):
+    w = 0
+    for ch in s:
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def trunc_disp(s, width):
+    if width <= 0:
+        return ""
+    w = 0
+    out = []
+    for ch in s:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > width:
+            break
+        w += cw
+        out.append(ch)
+    return "".join(out)
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# rsync prints this (in English, even under de_DE locale on this platform)
+# when a --files-from entry is a symlink/fifo/device instead of a regular
+# file — i.e. a TOCTOU swap after the scan. It must fail the batch.
+SKIP_RE = re.compile(r"skipping non-regular file")
+
+
+def disp_len(s):
+    """Display width of a string with ANSI SGR sequences stripped."""
+    return disp_width(ANSI_RE.sub("", s))
+
+
+def ensure_state_dir():
+    """Create/harden the state directory: must be a real directory owned by
+    the current user, mode 0700, never a symlink (CWE-59)."""
+    try:
+        st = os.lstat(STATE_DIR)
+    except FileNotFoundError:
+        try:
+            os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        except OSError as e:
+            raise SyncError("cannot create state directory %s: %s" % (STATE_DIR, e))
+        st = os.lstat(STATE_DIR)
+    except OSError as e:
+        raise SyncError("cannot access state directory %s: %s" % (STATE_DIR, e))
+    if stat.S_ISLNK(st.st_mode):
+        raise SyncError("state directory %s is a symlink; refusing" % STATE_DIR)
+    if not stat.S_ISDIR(st.st_mode):
+        raise SyncError("state path %s is not a directory" % STATE_DIR)
+    if st.st_uid != os.geteuid():
+        raise SyncError("state directory %s is not owned by the current user" % STATE_DIR)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def open_nofollow(path, mode, perms=0o600):
+    """open() that refuses to follow symlinks (O_NOFOLLOW)."""
+    flags = {"r": os.O_RDONLY,
+             "w": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+             "a": os.O_WRONLY | os.O_CREAT | os.O_APPEND}[mode[0]]
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, perms)
+    return os.fdopen(fd, mode, encoding="utf-8", errors="replace")
+
+
 def log(msg):
     try:
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8", errors="replace") as f:
-            f.write("%s %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
-    except OSError:
+        ensure_state_dir()
+        try:
+            if os.path.getsize(LOG_FILE) > MAX_LOG_BYTES:
+                try:
+                    os.unlink(LOG_FILE + ".old")
+                except OSError:
+                    pass
+                os.replace(LOG_FILE, LOG_FILE + ".old")
+        except OSError:
+            pass
+        with open_nofollow(LOG_FILE, "a") as f:
+            f.write("%s %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 safe_text(str(msg))))
+    except (OSError, SyncError):
         pass
 
 
@@ -114,31 +237,40 @@ def human_date(t):
 
 
 def valid_relpath(p):
-    if not p or p.startswith("/") or "\x00" in p or "\n" in p:
+    if not p or p.startswith("/"):
         return False
     for part in p.split("/"):
         if part in ("", ".", ".."):
             return False
+    # reject all C0 control characters (NUL, newline, CR, ESC, tab, ...)
+    # and DEL: they break line-based tools, inject terminal sequences, and
+    # are never legitimately needed in synced filenames (CWE-116)
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in p):
+        return False
     return True
 
 
 def ssh(args, timeout=None):
     cmd = ["ssh", "-o", "BatchMode=yes", HOST] + args
-    return subprocess.run(cmd, capture_output=True, timeout=timeout)
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise SyncError("ssh to %s timed out" % HOST)
 
 
 def check_connection():
     r = ssh(["true"], timeout=10)
     if r.returncode != 0:
         raise SyncError("no SSH connection to %s" % HOST)
-    r = ssh(["test", "-d", REMOTE_ROOT], timeout=10)
+    r = ssh(["test -d %s" % shlex.quote(REMOTE_ROOT)], timeout=10)
     if r.returncode != 0:
         raise SyncError("remote directory %s not accessible" % REMOTE_ROOT)
 
 
 def scan_local(root):
     out = {}
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    onerr = lambda e: log("walk error: %s" % e)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=onerr):
         for name in filenames:
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, root)
@@ -149,7 +281,9 @@ def scan_local(root):
                 st = os.lstat(full)
             except OSError:
                 continue
-            if not os.path.isfile(full):
+            # regular files only, matching the remote `find -type f` view;
+            # symlinks (and fifos/devices) are never treated as files (F2)
+            if not stat.S_ISREG(st.st_mode):
                 continue
             out[rel] = (st.st_size, st.st_mtime)
     return out
@@ -158,7 +292,11 @@ def scan_local(root):
 def scan_remote():
     fmt = "%P\\0%T@\\0%s\\0"
     cmd = "find %s -type f -printf '%s'" % (shlex.quote(REMOTE_ROOT), fmt)
-    r = subprocess.run(["ssh", "-o", "BatchMode=yes", HOST, cmd], capture_output=True, timeout=120)
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", HOST, cmd],
+                           capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise SyncError("remote scan timed out")
     if r.returncode != 0:
         raise SyncError("remote scan failed: %s" % r.stderr.decode(errors="replace")[:300])
     data = r.stdout.split(b"\0")
@@ -181,32 +319,82 @@ def scan_remote():
     return out
 
 
+def validate_state(data):
+    """Return a safe copy of the state dict: entries must be dicts with
+    "l"/"r" as [size:int, mtime:number]. Malformed entries are dropped with
+    a log line; an unknown future "version" invalidates the whole file."""
+    if not isinstance(data, dict):
+        log("state: ignoring non-dict state file")
+        return {}
+    version = data.get("version")
+    if isinstance(version, int) and version > STATE_VERSION:
+        log("state: unknown state version %r; ignoring" % version)
+        return {}
+    out = {}
+    for k, v in data.items():
+        if k == "version":
+            if isinstance(v, int):
+                out[k] = v
+            continue
+        if not isinstance(k, str) or not isinstance(v, dict):
+            log("state: skipping invalid entry %r" % k)
+            continue
+        ok = True
+        for side in ("l", "r"):
+            e = v.get(side)
+            if e is None:
+                continue  # missing side is legal (file absent on that side)
+            if not (isinstance(e, list) and len(e) == 2
+                    and isinstance(e[0], int)
+                    and isinstance(e[1], (int, float))):
+                ok = False
+                break
+        if not ok:
+            log("state: skipping invalid entry %r" % k)
+            continue
+        out[k] = v
+    return out
+
+
 def load_state():
     try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+        st = os.lstat(STATE_FILE)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_STATE_BYTES:
+            log("state: ignoring non-regular or oversized state file")
+            return {}
+        with open_nofollow(STATE_FILE, "r") as f:
+            return validate_state(json.load(f))
     except (OSError, ValueError):
         return {}
 
 
 def save_state(state):
-    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    ensure_state_dir()
+    state = dict(state)
+    state["version"] = STATE_VERSION
     tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, STATE_FILE)
+    try:
+        with open_nofollow(tmp, "w") as f:
+            json.dump(state, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        raise SyncError("cannot write state file: %s" % e)
 
 
 def classify(left, right, state):
     items = []
+    if not isinstance(state, dict):
+        state = {}
     paths = set(left) | set(right)
     for p in sorted(paths):
         sl, ml = left.get(p, (None, None))
         sr, mr = right.get(p, (None, None))
         entry = state.get(p)
+        if not isinstance(entry, dict):
+            entry = None
         if sl is None:
             items.append({"path": p, "sl": None, "ml": None, "sr": sr, "mr": mr,
                           "kind": "new_right", "act": "pull"})
@@ -274,42 +462,62 @@ def choose_bulk(items, mode, resolve):
 
 def run_rsync(paths, direction, simulate_remote, progress_cb):
     if not paths:
-        return
-    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        return 0
+    ensure_state_dir()
     tmp = tempfile.NamedTemporaryFile(mode="wb", dir=STATE_DIR, prefix="files-", delete=False)
     try:
+        # NUL-delimited list (rsync --from0): no NL/CR record splitting (F5)
         for p in sorted(paths):
-            tmp.write(p.encode("utf-8", "surrogateescape") + b"\n")
+            tmp.write(p.encode("utf-8", "surrogateescape") + b"\0")
         tmp.flush()
         os.fsync(tmp.fileno())
         tmp.close()
         os.chmod(tmp.name, 0o600)
-        args = ["rsync", "-rt", "--mkpath", "--timeout=120", "--info=progress2",
-                "--files-from=" + tmp.name]
+        args = ["rsync", "-rt", "--mkpath", "--timeout=120", "--from0", "-i",
+                "--info=progress2", "--files-from=" + tmp.name]
+        if STOP_AFTER > 0:
+            args.append("--stop-after=%d" % STOP_AFTER)
         if simulate_remote:
             if direction == "pull":
                 args += [simulate_remote.rstrip("/") + "/", LOCAL_ROOT.rstrip("/") + "/"]
             else:
                 args += [LOCAL_ROOT.rstrip("/") + "/", simulate_remote.rstrip("/") + "/"]
         else:
-            args += ["-e", "ssh -o BatchMode=yes"]
+            args += ["-e", "ssh -o BatchMode=yes -o ConnectTimeout=5"]
             if direction == "pull":
                 args += ["%s:%s/" % (HOST, REMOTE_ROOT.rstrip("/")), LOCAL_ROOT.rstrip("/") + "/"]
             else:
                 args += [LOCAL_ROOT.rstrip("/") + "/", "%s:%s/" % (HOST, REMOTE_ROOT.rstrip("/"))]
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, errors="replace")
-        last = 0
-        prog = re.compile(r"(\d+)%")
-        for line in proc.stdout:
-            m = prog.search(line)
-            if m:
-                last = int(m.group(1))
-            if progress_cb:
-                progress_cb(last, line.rstrip())
-        code = proc.wait()
-        if code != 0:
-            raise SyncError("rsync %s failed (%d)" % (direction, code))
+        transferred = 0
+        skipped = False
+        try:
+            last = 0
+            prog = re.compile(r"(\d+)%")
+            for line in proc.stdout:
+                if SKIP_RE.search(line):
+                    skipped = True
+                # rsync -i itemize: ">f..." = regular file transferred
+                if line.startswith(">f"):
+                    transferred += 1
+                m = prog.search(line)
+                if m:
+                    last = int(m.group(1))
+                if progress_cb:
+                    progress_cb(last, line.rstrip())
+        finally:
+            # never leave an orphan rsync behind on KeyboardInterrupt (F11)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        if skipped:
+            raise SyncError(
+                "rsync %s: a listed file was skipped (non-regular); "
+                "refusing to record state" % direction)
+        if proc.returncode != 0:
+            raise SyncError("rsync %s failed (%d)" % (direction, proc.returncode))
+        return transferred
     finally:
         try:
             os.unlink(tmp.name)
@@ -334,10 +542,17 @@ def hash_remote(paths, simulate_remote):
             except OSError:
                 pass
         return out
-    payload = b"".join(p.encode("utf-8", "surrogateescape") + b"\0" for p in sorted(paths))
-    cmd = "cd %s && xargs -0 -n 40 sha256sum -z 2>/dev/null; true" % shlex.quote(REMOTE_ROOT)
-    r = subprocess.run(["ssh", "-o", "BatchMode=yes", HOST, cmd], input=payload,
-                       capture_output=True, timeout=600)
+    payload = b"".join(("./" + p).encode("utf-8", "surrogateescape") + b"\0"
+                       for p in sorted(paths))
+    # '--' = POSIX end-of-options (OWASP); './' prefix makes even a file
+    # literally named "-" hash as a file, not stdin (coreutils special case)
+    cmd = ("cd %s && xargs -0 -n 40 sha256sum -z -- 2>/dev/null; true"
+           % shlex.quote(REMOTE_ROOT))
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", HOST, cmd], input=payload,
+                           capture_output=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        raise SyncError("remote hashing timed out")
     if r.returncode != 0:
         raise SyncError("remote hashing failed: %s" % r.stderr.decode(errors="replace")[:300])
     out = {}
@@ -347,10 +562,14 @@ def hash_remote(paths, simulate_remote):
         h, sep, name = rec.partition(b"  ")
         if len(h) != 64 or not sep:
             continue
+        if name.startswith(b"./"):
+            name = name[2:]
         p = name.decode("utf-8", "surrogateescape")
         if not valid_relpath(p):
             continue
         out[p] = h.decode("ascii", "replace")
+    if paths and not out:
+        raise SyncError("remote hashing produced no results")
     return out
 
 
@@ -371,24 +590,28 @@ def verify_contents(left, right, items, simulate_remote):
         if l and r and l != r:
             it["kind"] = "unsure"
             it["act"] = None
-            log("content mismatch: %s" % it["path"])
+            log("content mismatch: %s" % safe_text(it["path"]))
 
 
 def apply_transfers(items, simulate_remote, progress_cb=None):
     pulls = [it for it in items if it["act"] == "pull"]
     pushes = [it for it in items if it["act"] == "push"]
     state = load_state()
+    pulled = pushed = 0
     if pulls:
-        run_rsync([it["path"] for it in pulls], "pull", simulate_remote, progress_cb)
+        pulled = run_rsync([it["path"] for it in pulls], "pull", simulate_remote, progress_cb)
         for it in pulls:
             state[it["path"]] = {"l": [it["sr"], it["mr"]], "r": [it["sr"], it["mr"]]}
-        save_state(state)
     if pushes:
-        run_rsync([it["path"] for it in pushes], "push", simulate_remote, progress_cb)
+        pushed = run_rsync([it["path"] for it in pushes], "push", simulate_remote, progress_cb)
         for it in pushes:
             state[it["path"]] = {"l": [it["sl"], it["ml"]], "r": [it["sl"], it["ml"]]}
+    if pulls or pushes:
+        # prune state entries for files that no longer exist on either side
+        live = {it["path"] for it in items}
+        state = {k: v for k, v in state.items() if k == "version" or k in live}
         save_state(state)
-    return len(pulls), len(pushes)
+    return pulled, pushed
 
 
 ICON_PULL = "\u21e3"
@@ -428,34 +651,34 @@ def fmt_row(it):
     line = "%s  %-22s %9s %s   |   %9s %s" % (
         item_icon(it), it["path"], human_size(it["sl"]), human_date(it["ml"]),
         human_size(it["sr"]), human_date(it["mr"]))
-    return line.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    return safe_text(line)
 
 
 def sanitize(s, width):
-    s = s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
-    s = "".join(ch if ch >= " " else "?" for ch in s)
-    if len(s) > width:
-        s = s[: max(0, width - 3)] + "..."
+    s = safe_text(s)
+    if disp_width(s) > width:
+        s = trunc_disp(s, max(0, width - 3)) + "..."
     return s
 
 
 def collapse_path(p, width):
+    p = safe_text(p)
     if width <= 4:
         return "..." if p else ""
-    if len(p) <= width:
+    if disp_width(p) <= width:
         return p
     parts = p.split("/")
     if len(parts) <= 2:
-        return p[: max(0, width - 3)] + "..."
+        return trunc_disp(p, max(0, width - 3)) + "..."
     head, tail = parts[0], parts[-1]
     out = head
     for part in parts[1:-1]:
         cand = out + "/" + part
-        if len(cand) + len(tail) + 6 <= width:
+        if disp_width(cand) + disp_width(tail) + 6 <= width:
             out = cand
         else:
             break
-    if len(out) + len(tail) + 4 <= width:
+    if disp_width(out) + disp_width(tail) + 4 <= width:
         return out + "/\u2026/" + tail
     return out
 
@@ -483,15 +706,18 @@ def report(items, color, scan_seconds):
 
     def item_line(it):
         icon = st(ICON_PULL, C_BLUE) if it["act"] == "pull" else st(ICON_PUSH, C_YELLOW)
-        name = it["path"].split("/")[-1]
+        name = safe_text(it["path"].split("/")[-1])
         size = human_size(it["sr"] if it["act"] == "pull" else it["sl"])
         date = human_date(it["mr"] if it["act"] == "pull" else it["ml"])
         ann = annotation(it)
         prefix = "  %s %s" % (icon, name)
         suffix = "  %8s  %s  %s" % (size, date, ann)
-        avail = max(20, width - len(suffix))
-        if len(prefix) > avail:
-            prefix = prefix[: max(0, avail - 3)] + "..."
+        avail = max(20, width - disp_len(suffix))
+        if disp_len(prefix) > avail:
+            # truncate by display width, ignoring ANSI codes in the icon
+            budget = max(1, avail - disp_len("  " + icon + " ") - 3)
+            name = trunc_disp(name, budget) + "..."
+            prefix = "  %s %s" % (icon, name)
         return prefix + suffix
 
     lines = []
@@ -610,50 +836,60 @@ class App:
             self.scroll = self.cursor - rows + 1
 
     def draw(self, scr):
-        scr.erase()
-        h, w = scr.getmaxyx()
-        c = self.counts()
-        header = "L: %s   R: %s:%s" % (LOCAL_ROOT, HOST, REMOTE_ROOT)
-        scr.addstr(0, 0, sanitize(header, w), curses.A_BOLD | curses.A_REVERSE)
-        status = "  %s %d (%s) in   %s %d (%s) out   %s %d unsure   %s %d same   filter: %s   verify: %s" % (
-            ICON_PULL, c["pull"], human_size(c["pull_b"]),
-            ICON_PUSH, c["push"], human_size(c["push_b"]),
-            ICON_UNSURE, c["unsure"], ICON_SAME, c["same"],
-            self.filter, "on" if self.verify else "off")
-        scr.addstr(1, 0, sanitize(status, w), curses.A_DIM)
-        vis = self.visible()
-        self.clamp_view(h)
-        for row in range(2, h - 3):
-            idx = self.scroll + row - 2
-            if idx >= len(vis):
-                break
-            it = vis[idx]
-            line = fmt_row(it)
-            attr = curses.A_NORMAL
-            if it["act"] is None and it["kind"] == "unsure":
-                attr = curses.A_BOLD
-            if idx == self.cursor:
-                attr |= curses.A_UNDERLINE
-            if idx in self.sel:
-                attr |= curses.A_REVERSE
-            scr.addstr(row, 0, sanitize(line, w), attr)
-        if len(vis) == 0:
-            scr.addstr(3, 0, "no differences")
-        footer = ("[1] pull all  [2] push all  [3] newest wins  [4] apply selection  "
-                  "space select  >/< force dir  arrows move  n/u/a filter  h help  q quit")
-        scr.addstr(h - 2, 0, sanitize(footer, w), curses.A_REVERSE)
-        scr.addstr(h - 1, 0, sanitize(self.msg, w))
-        scr.refresh()
+        try:
+            h, w = scr.getmaxyx()
+            if h < 3 or w < 10:
+                return
+            scr.erase()
+            c = self.counts()
+            header = "L: %s   R: %s:%s" % (LOCAL_ROOT, HOST, REMOTE_ROOT)
+            scr.addstr(0, 0, sanitize(header, w), curses.A_BOLD | curses.A_REVERSE)
+            status = "  %s %d (%s) in   %s %d (%s) out   %s %d unsure   %s %d same   filter: %s   verify: %s" % (
+                ICON_PULL, c["pull"], human_size(c["pull_b"]),
+                ICON_PUSH, c["push"], human_size(c["push_b"]),
+                ICON_UNSURE, c["unsure"], ICON_SAME, c["same"],
+                self.filter, "on" if self.verify else "off")
+            scr.addstr(1, 0, sanitize(status, w), curses.A_DIM)
+            vis = self.visible()
+            self.clamp_view(h)
+            for row in range(2, h - 3):
+                idx = self.scroll + row - 2
+                if idx >= len(vis):
+                    break
+                it = vis[idx]
+                line = fmt_row(it)
+                attr = curses.A_NORMAL
+                if it["act"] is None and it["kind"] == "unsure":
+                    attr = curses.A_BOLD
+                if idx == self.cursor:
+                    attr |= curses.A_UNDERLINE
+                if idx in self.sel:
+                    attr |= curses.A_REVERSE
+                scr.addstr(row, 0, sanitize(line, w), attr)
+            if len(vis) == 0 and h > 4:
+                scr.addstr(3, 0, "no differences")
+            footer = ("[1] pull all  [2] push all  [3] newest wins  [4] apply selection  "
+                      "space select  >/< force dir  arrows move  n/u/a filter  h help  q quit")
+            scr.addstr(h - 2, 0, sanitize(footer, w), curses.A_REVERSE)
+            scr.addstr(h - 1, 0, sanitize(self.msg, w))
+            scr.refresh()
+        except curses.error:
+            pass  # terminal too small / mid-resize; next draw will retry
 
     def prompt(self, scr, text):
         h, w = scr.getmaxyx()
-        scr.addstr(h - 1, 0, sanitize(text, w))
-        curses.echo()
+        if h < 1 or w < 1:
+            return ""
         try:
-            scr.refresh()
-            return scr.getstr(h - 1, min(len(text), w - 1)).decode("utf-8", "replace").strip()
-        finally:
-            curses.noecho()
+            scr.addstr(h - 1, 0, sanitize(text, w))
+            curses.echo()
+            try:
+                scr.refresh()
+                return scr.getstr(h - 1, min(len(text), w - 1)).decode("utf-8", "replace").strip()
+            finally:
+                curses.noecho()
+        except curses.error:
+            return ""
 
     def current(self):
         vis = self.visible()
@@ -701,37 +937,42 @@ class App:
             self.msg = "%s: already %s" % (it["path"], it["act"])
 
     def help_screen(self, scr):
-        scr.erase()
-        h, w = scr.getmaxyx()
-        lines = [
-            "KEYS",
-            "  1          pull all: copy everything newer/only on the laptop here",
-            "  2          push all: copy everything newer/only here to the laptop",
-            "  3          newest wins: newest mtime wins everywhere",
-            "  4 / Enter  apply the rows you selected with space",
-            "  space      select / deselect the row under the cursor",
-            "  > / <      force row: keep laptop / local version",
-            "  arrows     move cursor (PgUp/PgDn/Home/End also work)",
-            "  n / u / a  filter: new only / unsure only / all rows",
-            "  v          verify: hash equal-mtime files, detect hidden changes",
-            "  q          quit without changing anything",
-            "",
-            "ICONS",
-            "  %s          copy FROM laptop (pull)" % ICON_PULL,
-            "  %s          copy TO laptop (push)" % ICON_PUSH,
-            "  %s          unsure (changed on both sides) - decide with >/< or the bulk prompt" % ICON_UNSURE,
-            "  %s          identical (shown only in 'all' filter)" % ICON_SAME,
-            "",
-            "SAFETY",
-            "  nothing is ever deleted; transfers are confirmed before they run;",
-            "  a summary with file count and size appears before applying.",
-        ]
-        for i, ln in enumerate(lines):
-            if i < h - 1:
-                scr.addstr(i, 0, sanitize(ln, w))
-        scr.addstr(h - 1, 0, sanitize("press any key to return", w), curses.A_REVERSE)
-        scr.refresh()
-        scr.getch()
+        try:
+            h, w = scr.getmaxyx()
+            if h < 2 or w < 10:
+                return
+            scr.erase()
+            lines = [
+                "KEYS",
+                "  1          pull all: copy everything newer/only on the laptop here",
+                "  2          push all: copy everything newer/only here to the laptop",
+                "  3          newest wins: newest mtime wins everywhere",
+                "  4 / Enter  apply the rows you selected with space",
+                "  space      select / deselect the row under the cursor",
+                "  > / <      force row: keep laptop / local version",
+                "  arrows     move cursor (PgUp/PgDn/Home/End also work)",
+                "  n / u / a  filter: new only / unsure only / all rows",
+                "  v          verify: hash equal-mtime files, detect hidden changes",
+                "  q          quit without changing anything",
+                "",
+                "ICONS",
+                "  %s          copy FROM laptop (pull)" % ICON_PULL,
+                "  %s          copy TO laptop (push)" % ICON_PUSH,
+                "  %s          unsure (changed on both sides) - decide with >/< or the bulk prompt" % ICON_UNSURE,
+                "  %s          identical (shown only in 'all' filter)" % ICON_SAME,
+                "",
+                "SAFETY",
+                "  nothing is ever deleted; transfers are confirmed before they run;",
+                "  a summary with file count and size appears before applying.",
+            ]
+            for i, ln in enumerate(lines):
+                if i < h - 1:
+                    scr.addstr(i, 0, sanitize(ln, w))
+            scr.addstr(h - 1, 0, sanitize("press any key to return", w), curses.A_REVERSE)
+            scr.refresh()
+            scr.getch()
+        except curses.error:
+            pass
 
     def bulk(self, scr, mode, sel_only):
         if sel_only:
@@ -771,7 +1012,7 @@ class App:
         try:
             pulls, pushes = apply_transfers(picks, self.sim, cb)
             log("applied %d files (%d pulled, %d pushed)" % (n, pulls, pushes))
-            self.msg = "done: %d files applied" % n
+            self.msg = "done: %d files applied" % (pulls + pushes)
         except SyncError as e:
             log("error: %s" % e)
             self.msg = "error: %s" % e
@@ -794,8 +1035,11 @@ class App:
     def run(self, scr):
         curses.curs_set(0)
         while True:
-            self.draw(scr)
-            key = scr.getch()
+            try:
+                self.draw(scr)
+                key = scr.getch()
+            except curses.error:
+                continue  # terminal too small or mid-resize; keep the loop alive
             if key in (ord("q"), 27):
                 return
             elif key in (ord("1"),):
@@ -869,73 +1113,94 @@ def main():
         REMOTE_ROOT = os.path.abspath(args.simulate_remote)
 
     try:
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        lock = open(LOCK_FILE, "w")
+        ensure_state_dir()
+        fd = os.open(LOCK_FILE, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        lock = os.fdopen(fd, "w")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except SyncError as e:
+        print("error: %s" % e, file=sys.stderr)
+        sys.exit(2)
+    except BlockingIOError:
         print("another sync is already running", file=sys.stderr)
         sys.exit(2)
-
-    if args.reset_state:
-        try:
-            os.unlink(STATE_FILE)
-        except OSError:
-            pass
-        print("state reset")
-        return
+    except OSError as e:
+        print("cannot acquire sync lock: %s" % e, file=sys.stderr)
+        sys.exit(2)
 
     try:
-        if not args.simulate_remote:
-            check_connection()
-    except SyncError as e:
-        print("connection error: %s" % e, file=sys.stderr)
-        sys.exit(1)
-
-    if args.check:
-        print("connection OK: %s -> %s" % (HOST, REMOTE_ROOT))
-        return
-
-    t0 = time.perf_counter()
-    try:
-        left = scan_local(LOCAL_ROOT)
-        right = scan_remote() if not args.simulate_remote else scan_local(args.simulate_remote)
-    except SyncError as e:
-        print("scan error: %s" % e, file=sys.stderr)
-        sys.exit(1)
-    scan_seconds = time.perf_counter() - t0
-    items = classify(left, right, load_state())
-    if args.verify:
-        print("verifying contents...", file=sys.stderr)
-        verify_contents(left, right, items, args.simulate_remote)
-
-    if args.list:
-        if args.plain:
-            for it in items:
-                if it["kind"] == "same":
-                    continue
-                print(fmt_row(it))
-            print("total differences: %d" % sum(1 for it in items if it["kind"] != "same"))
-        else:
-            report(items, color=sys.stdout.isatty(), scan_seconds=scan_seconds)
-        return
-
-    if args.pull or args.push or args.newest:
-        mode = "pull" if args.pull else ("push" if args.push else "newest")
-        resolve = args.resolve if args.resolve != "skip" else ("newest" if mode == "newest" else "skip")
-        picks = choose_bulk(items, mode, resolve)
-        if not picks:
-            print("nothing to do")
+        if args.reset_state:
+            try:
+                os.unlink(STATE_FILE)
+            except OSError:
+                pass
+            print("state reset")
             return
-        pulls, pushes = apply_transfers(picks, args.simulate_remote)
-        log("applied %d files (%d pulled, %d pushed)" % (len(picks), pulls, pushes))
-        print("done: %d files applied" % len(picks))
-        return
 
-    app = App(items, args.simulate_remote)
-    try:
-        curses.wrapper(app.run)
+        if not args.simulate_remote:
+            try:
+                check_connection()
+            except SyncError as e:
+                print("connection error: %s" % e, file=sys.stderr)
+                sys.exit(1)
+
+        if args.check:
+            if args.simulate_remote:
+                print("connection OK (simulated): %s -> %s" % (HOST, REMOTE_ROOT))
+            else:
+                print("connection OK: %s -> %s" % (HOST, REMOTE_ROOT))
+            return
+
+        t0 = time.perf_counter()
+        try:
+            left = scan_local(LOCAL_ROOT)
+            right = scan_remote() if not args.simulate_remote else scan_local(args.simulate_remote)
+        except SyncError as e:
+            print("scan error: %s" % e, file=sys.stderr)
+            sys.exit(1)
+        scan_seconds = time.perf_counter() - t0
+        items = classify(left, right, load_state())
+        if args.verify:
+            print("verifying contents...", file=sys.stderr)
+            verify_contents(left, right, items, args.simulate_remote)
+
+        if args.list:
+            if args.plain:
+                for it in items:
+                    if it["kind"] == "same":
+                        continue
+                    print(fmt_row(it))
+                print("total differences: %d" % sum(1 for it in items if it["kind"] != "same"))
+            else:
+                report(items, color=sys.stdout.isatty(), scan_seconds=scan_seconds)
+            return
+
+        if args.pull or args.push or args.newest:
+            mode = "pull" if args.pull else ("push" if args.push else "newest")
+            resolve = args.resolve if args.resolve != "skip" else ("newest" if mode == "newest" else "skip")
+            picks = choose_bulk(items, mode, resolve)
+            if not picks:
+                print("nothing to do")
+                return
+            pulls, pushes = apply_transfers(picks, args.simulate_remote)
+            log("applied %d files (%d pulled, %d pushed)" % (len(picks), pulls, pushes))
+            print("done: %d files applied" % (pulls + pushes))
+            return
+
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print("interactive mode requires a terminal; use --list, --pull or --push instead",
+                  file=sys.stderr)
+            sys.exit(2)
+
+        app = App(items, args.simulate_remote)
+        try:
+            curses.wrapper(app.run)
+        except KeyboardInterrupt:
+            pass
+    except SyncError as e:
+        print("error: %s" % e, file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
-        pass
+        sys.exit(130)
 
 
 if __name__ == "__main__":

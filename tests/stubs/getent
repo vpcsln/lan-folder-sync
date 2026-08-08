@@ -1,0 +1,9 @@
+#!/bin/bash
+# Stub getent: mDNS resolution for the sandboxed laptop.
+# FAKE_MDNS_IP unset  -> no mDNS (default)
+# FAKE_MDNS_IP set    -> "host.local" resolves to that IPv4
+if [[ "$1" == "hosts" && "$2" == *".local" && -n "${FAKE_MDNS_IP:-}" ]]; then
+    echo "$FAKE_MDNS_IP $2"
+    exit 0
+fi
+exit 1

@@ -49,8 +49,10 @@ Next step: lan-sync --pull   (copies 13 files from the laptop)
 - **Automatic laptop discovery**: cached IP → mDNS (`host.local`) → subnet
   scan, verified by SSH key + OS identity — no reconfiguration when the DHCP
   address changes
-- **Secure by design**: key-only SSH, host-key pinning, validated paths, no
-  shell interpolation of filenames (see [SECURITY.md](SECURITY.md))
+- **Secure by design**: key-only SSH, pinned host keys (never auto-accepted
+  or auto-erased), validated paths (no control characters, byte-exact
+  non-UTF-8 names), display-safe output, no shell interpolation of
+  filenames (see [SECURITY.md](SECURITY.md))
 - **Atomic transfers** via `rsync` (temp file + rename), single-instance lock,
   crash-safe state bookkeeping
 
@@ -99,8 +101,9 @@ cp config.example.json ~/.config/lan-folder-sync/config.json
 | `remote_user` | username on the other machine | `vpc` |
 | `local_root` | folder to sync on this machine | `~/Dokumente/studium` |
 | `remote_root` | folder to sync on the other machine | `/home/vpc/Dokumente/studium` |
-| `ssh_key` | SSH key used for the connection | `~/.ssh/id_ed25519_sync` |
+| `ssh_key` | SSH key used by discovery probes (transfers use `~/.ssh/config`) | `~/.ssh/id_ed25519_sync` |
 | `os_match` | string that identifies the laptop in `/etc/os-release` (used by discovery) | `cachyos` |
+| `stop_after_minutes` | wall-clock cap per transfer (rsync `--stop-after`; `0` = unlimited) | `0` |
 
 Every setting can also be overridden by an environment variable:
 
@@ -112,6 +115,11 @@ Every setting can also be overridden by an environment variable:
 | `LAN_SYNC_REMOTE_ROOT` | `remote_root` |
 | `LAN_SYNC_SSH_KEY` | `ssh_key` |
 | `LAN_SYNC_OS_MATCH` | `os_match` |
+| `LAN_SYNC_STOP_AFTER` | `stop_after_minutes` |
+
+Config and env values are validated (safe character sets, absolute remote
+root, no control characters); invalid values fall back to the defaults and
+are logged.
 
 If no config file exists, the defaults in the table above are used — the tool
 works out of the box for a CachyOS laptop with user `vpc`.
@@ -150,12 +158,23 @@ name, so a changing DHCP address never breaks host-key verification.
 ### 4. First run
 
 ```bash
-lan-sync --check   # verify connection and unison-free pipeline
-lan-sync --list    # read-only difference report
-lan-sync           # interactive viewer
+lan-sync.sh --check   # discovery + connection check
+lan-sync --check      # verify connection and unison-free pipeline
+lan-sync --list       # read-only difference report
+lan-sync              # interactive viewer
 ```
 
-The first run has no sync history, so files differing on both sides with
+On the very first run the laptop's host key is not pinned yet. The launcher
+then shows you the machine's fingerprint and asks you to confirm it
+interactively (it refuses to auto-accept keys — there is no
+trust-on-first-use). If you run it from a script or cron, pin the key once
+by hand instead:
+
+```bash
+ssh -o StrictHostKeyChecking=ask cachyos true   # verify the fingerprint, answer yes
+```
+
+The first sync run has no history, so files differing on both sides with
 similar mtimes are reported as `⚠` and you decide. After the first successful
 sync, a state file enables real conflict detection ("changed on both sides
 since the last sync").
@@ -230,6 +249,12 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full details.
 - Is it on the same network and is `sshd` running there?
   (`sudo systemctl enable --now sshd`)
 - Is your key installed? (`ssh-copy-id -i ~/.ssh/id_ed25519_sync.pub user@ip`)
+- Did the laptop's host key change (reinstall)? Discovery refuses machines
+  whose key does not match the pinned one. Re-pin manually after verifying
+  the new fingerprint:
+  `ssh-keygen -R cachyos && ssh -o StrictHostKeyChecking=ask cachyos true`
+- IPv6-only network? Discovery's subnet scan and mDNS filtering are IPv4;
+  set a fixed `HostName` in `~/.ssh/config` instead.
 - University/guest Wi-Fi (eduroam) often blocks direct device connections —
   check with `ping <ip>`; if ping works but port 22 is blocked, a firewall on
   the remote machine is the likely cause (`sudo ufw allow 22/tcp`).
@@ -258,6 +283,28 @@ with identical mtimes the file is skipped.
 - The tool is single-instance (file lock); concurrent runs refuse to start.
 - Transfers go through your own SSH key; the script never stores or prompts
   for passwords.
+- No cross-machine lock: two machines syncing the same remote folder at the
+  same time are not coordinated (per-file atomic renames keep individual
+  files consistent).
+
+## Development
+
+Run the regression suite (needs only Python 3, rsync, and standard shell
+tools; it never touches the network or your real `~/.ssh`):
+
+```bash
+tests/run_tests.sh
+```
+
+The suite covers every security fix (hostile filenames, symlinks, state
+tampering, state-dir symlink attacks, discovery impostor rejection, config
+validation, terminal-escape safety, log rotation, …) plus the verified-safe
+behaviors (argv-only command construction, NUL-delimited file lists, byte
+round-trips, lock semantics, `--verify`). Launcher tests run in a sandbox
+`HOME` with stubbed `ssh`/`ssh-keygen`/`ip`/`timeout`/`getent` — the real
+`ssh-keygen` resolves `known_hosts` via the passwd database (not `$HOME`),
+so it must never be executed by the tests. Test trees live under
+`/tmp/opencode/tests-regression`.
 
 ## License
 
